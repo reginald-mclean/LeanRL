@@ -3,6 +3,9 @@ import os
 
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
+import sys
+sys.path.append('/home/reggiemclean/LeanRL/')
+
 import math
 import os
 import random
@@ -24,8 +27,8 @@ from tensordict.nn import CudaGraphModule, TensorDictModule
 
 import metaworld
 
-from env_setup_metaworld import make_envs, make_eval_envs
-
+from utils.env_setup_metaworld import make_envs, make_eval_envs
+from utils.metaworld_jax_eval import evaluation
 # from stable_baselines3.common.buffers import ReplayBuffer
 from torchrl.data import LazyTensorStorage, ReplayBuffer
 torch.set_float32_matmul_precision('high')
@@ -96,43 +99,55 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
-    def __init__(self, env, n_act, n_obs, device=None):
+    def __init__(self, env, n_tasks=10, device=None):
         super().__init__()
-        self.fc1 = nn.Linear(n_act + n_obs, 400, device=device)
-        self.fc2 = nn.Linear(400, 400, device=device)
+        self.n_tasks = n_tasks
+        self.fc1 = nn.Linear(43, 400, device=device)
+        self.fc2 = nn.Linear(400, 4000, device=device)
         self.fc3 = nn.Linear(400, 1, device=device)
+        self.device = device
 
     def forward(self, x, a):
+        x, task_id = split_obs_task_id(x, self.n_tasks)
         x = torch.cat([x, a], 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+        indices = (
+            torch.arange(400, device='cuda:0')[None, :]
+            + (task_id.argmax(1) * 400)[..., None]
+        )
+
+        x = torch.take_along_dim(x, indices, dim=1)
         x = self.fc3(x)
         return x
 
 
 LOG_STD_MAX = 2
-LOG_STD_MIN = -20
+LOG_STD_MIN = -5
 
 def split_obs_task_id(obs, num_tasks):
     return obs[..., :-num_tasks], obs[..., -num_tasks:]
+
 
 class Actor(nn.Module):
     def __init__(self, env, n_obs, n_act, n_tasks=10, device=None):
         super().__init__()
         self.n_tasks = n_tasks
-        self.fc1 = nn.Linear(n_obs, 400, device=device)
+        self.fc1 = nn.Linear(39, 400, device=device)
         self.fc2 = nn.Linear(400, 400, device=device)
         self.fc3 = nn.Linear(400, 400*n_tasks, device=device)
         self.fc_mean = nn.Linear(400, n_act, device=device)
         self.fc_logstd = nn.Linear(400, n_act, device=device)
         # action rescaling
+        self.device = device
+
         self.register_buffer(
             "action_scale",
-            torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32, device=device),
+            torch.tensor((env.single_action_space.high - env.single_action_space.low) / 2.0, dtype=torch.float32, device=device),
         )
         self.register_buffer(
             "action_bias",
-            torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32, device=device),
+            torch.tensor((env.single_action_space.high + env.single_action_space.low) / 2.0, dtype=torch.float32, device=device),
         )
 
     def forward(self, x, task_id):
@@ -140,12 +155,11 @@ class Actor(nn.Module):
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
         indices = (
-            torch.arange(400)[None, :]
-            + (task_idx.argmax(1) * 400)[..., None]
+            torch.arange(400, device=self.device)[None, :]
+            + (task_id.argmax(1) * 400)[..., None]
         )
 
         x = torch.take_along_dim(x, indices, dim=1)
-
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
@@ -160,6 +174,7 @@ class Actor(nn.Module):
         normal = torch.distributions.Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
         y_t = torch.tanh(x_t)
+
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
         # Enforcing Action Bound
@@ -206,19 +221,19 @@ if __name__ == "__main__":
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs, device=device, n_act=n_act, n_obs=n_obs, n_tasks=10)
-    actor_detach = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
+    actor_detach = Actor(envs, device=device, n_act=n_act, n_obs=n_obs, n_tasks=10)
     # Copy params to actor_detach without grad
     from_module(actor).data.to_module(actor_detach)
     policy = TensorDictModule(actor_detach.get_action, in_keys=["observation"], out_keys=["action"])
 
     def get_q_params():
-        qf1 = SoftQNetwork(envs, device=device, n_act=n_act, n_obs=n_obs)
-        qf2 = SoftQNetwork(envs, device=device, n_act=n_act, n_obs=n_obs)
+        qf1 = SoftQNetwork(envs, device=device)
+        qf2 = SoftQNetwork(envs, device=device)
         qnet_params = from_modules(qf1, qf2, as_module=True)
         qnet_target = qnet_params.data.clone()
 
         # discard params of net
-        qnet = SoftQNetwork(envs, device="meta", n_act=n_act, n_obs=n_obs)
+        qnet = SoftQNetwork(envs, device="meta")
         qnet_params.to_module(qnet)
 
         return qnet_params, qnet_target, qnet
@@ -228,14 +243,16 @@ if __name__ == "__main__":
     q_optimizer = optim.Adam(qnet.parameters(), lr=args.q_lr, capturable=args.cudagraphs and not args.compile)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr, capturable=args.cudagraphs and not args.compile)
 
-    target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-    log_alpha = torch.zeros(10, requires_grad=True, device=device)
-    alpha = log_alpha.detach().exp()
-    a_optimizer = optim.Adam([log_alpha], lr=args.q_lr, capturable=args.cudagraphs and not args.compile)
+    # Automatic entropy tuning
+    if args.autotune:
+        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        alpha = log_alpha.detach().exp()
+        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr, capturable=args.cudagraphs and not args.compile)
+    else:
+        alpha = torch.as_tensor(args.alpha, device=device)
 
     envs.single_observation_space.dtype = np.float32
-
-
     rb = ReplayBuffer(storage=LazyTensorStorage(args.buffer_size, device=device))
 
     def batched_qf(params, obs, action, next_q_value=None):
@@ -254,6 +271,7 @@ if __name__ == "__main__":
             qf_next_target = torch.vmap(batched_qf, (0, None, None))(
                 qnet_target, data["next_observations"], next_state_actions
             )
+
             min_qf_next_target = qf_next_target.min(dim=0).values - alpha * next_state_log_pi
             next_q_value = data["rewards"].flatten() + (
                 ~data["dones"].flatten()
@@ -302,7 +320,7 @@ if __name__ == "__main__":
     if args.cudagraphs:
         update_main = CudaGraphModule(update_main, in_keys=[], out_keys=[])
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
-        policy = CudaGraphModule(policy)
+        # policy = CudaGraphModule(policy)
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)

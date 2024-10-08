@@ -343,14 +343,14 @@ if __name__ == "__main__":
 
     # Compile policy
     if args.compile:
-        mode = None  # "reduce-overhead" if not args.cudagraphs else None
+        mode = "reduce-overhead" if not args.cudagraphs else None
         policy = torch.compile(policy, mode=mode)
         gae = torch.compile(gae, fullgraph=True, mode=mode)
         update = torch.compile(update, mode=mode)
 
     if args.cudagraphs:
         policy = CudaGraphModule(policy)
-        gae = CudaGraphModule(gae)
+        #gae = CudaGraphModule(gae)
         update = CudaGraphModule(update)
 
     avg_returns = deque(maxlen=20)
